@@ -1,8 +1,5 @@
 allprojects {
     repositories {
-        // China-friendly mirrors first, official repos as fallback
-        maven { url 'https://maven.aliyun.com/repository/google' }
-        maven { url 'https://maven.aliyun.com/repository/central' }
         google()
         mavenCentral()
     }
