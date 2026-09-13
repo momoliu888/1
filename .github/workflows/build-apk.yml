@@ -1,0 +1,51 @@
+name: Build APK
+
+# 云端构建：push 到 main 分支或手动触发时，自动构建中文版 iappyxOS APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter 3.44.1 (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.44.1'
+          cache: true
+
+      - name: Verify Flutter
+        run: flutter --version
+
+      - name: Pub get (container app)
+        working-directory: src/container_app
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: src/container_app
+        run: flutter build apk --release
+
+      - name: Copy APK to bin/
+        run: |
+          mkdir -p bin
+          cp src/container_app/build/app/outputs/flutter-apk/app-release.apk bin/iappyxOS.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iappyxOS-中文版-apk
+          path: |
+            bin/iappyxOS.apk
+          if-no-files-found: error

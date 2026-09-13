@@ -1,0 +1,1632 @@
+// MIT License
+//
+// Copyright (c) 2026 iappyx
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+/// Screen for creating new apps via AI prompt, web URL, or demo template.
+
+import 'dart:io';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
+import '../services/generator.dart';
+import '../services/bundle_storage.dart';
+import '../services/prompt_builder.dart';
+import '../services/app_storage.dart';
+import '../services/ai_service.dart';
+import '../services/settings_service.dart';
+import '../widgets/build_log.dart';
+import '../models/icon_config.dart';
+import '../models/ai_provider.dart';
+import 'preview_screen.dart';
+import 'icon_editor_screen.dart';
+import '../services/error_helper.dart';
+import 'flows/create_helpers.dart' as h;
+import 'showcase_screen.dart';
+
+class CreateScreen extends StatefulWidget {
+  final VoidCallback? onAppSaved;
+  final VoidCallback? onViewMyApps;
+  const CreateScreen({super.key, this.onAppSaved, this.onViewMyApps});
+  @override
+  State<CreateScreen> createState() => CreateScreenState();
+}
+
+class CreateScreenState extends State<CreateScreen> {
+  String? _mode;
+  bool _isBuilding = false;
+  bool _showBuildLog = false;
+  final List<String> _log = [];
+
+  final _nameController = TextEditingController();
+  IconConfig _iconConfig = IconConfig();
+  String? _editingId;
+  String? _existingPackageName;
+  String _firebaseConfig = '';
+
+  final _urlController = TextEditingController();
+  String? _urlError;
+  final _descController = TextEditingController();
+  final _htmlController = TextEditingController();
+  String _generatedPrompt = '';
+  bool _descExpanded = true;
+  bool _promptVisible = false;
+  bool _promptExpanded = false;
+  bool _promptCopied = false;
+  bool _htmlExpanded = false;
+
+  String? _selectedDemoId;
+  final _demoFilterController = TextEditingController();
+  String _demoFilter = '';
+
+  // Manual-flow prompt variant: 'full' (~45KB, works anywhere) or
+  // 'linked' (~600 chars, references the hosted SPEC.md — needs an AI that can fetch URLs).
+  String _promptVariant = 'full';
+  String _generatedLinkedPrompt = '';
+
+  // Bundled app files (databases, JSON, images, etc.)
+  List<Map<String, dynamic>> _bundleFiles = [];
+  bool _bundleExpanded = false;
+  String? _pendingShowcaseBundleId; // set when loading a showcase app with resources
+
+  // AI generation
+  String _genMethod = ''; // 'api', 'manual'
+  AiProvider? _activeProvider;
+  bool _loadingProvider = false;
+  List<ChatMessage> _conversation = [];
+  bool _aiGenerating = false;
+  DateTime? _genStartTime;
+  int _genId = 0;
+  final _followUpController = TextEditingController();
+  String? _selectedHtml; // HTML selected via "Use This"
+  final _formScrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _nameController.dispose();
+    _urlController.dispose();
+    _descController.dispose();
+    _htmlController.dispose();
+    _followUpController.dispose();
+    _formScrollController.dispose();
+    _demoFilterController.dispose();
+    super.dispose();
+  }
+
+  void _addLog(String msg) { if (mounted) setState(() => _log.add(msg)); }
+
+  void loadApp(AppData app) {
+    _nameController.text = app.name;
+    _descController.text = app.description;
+    _htmlController.text = app.html;
+    _generatedPrompt = app.prompt;
+    _editingId = app.id;
+    _existingPackageName = app.packageName;
+    _firebaseConfig = app.firebaseConfig;
+    _selectedDemoId = null;
+    _isBuilding = false;
+    _showBuildLog = false;
+    _log.clear();
+    _genMethod = 'manual';
+    _descExpanded = true;
+    _htmlExpanded = true;
+    _conversation.clear();
+    _loadBundleFiles();
+    _aiGenerating = false;
+    _selectedHtml = null;
+    _followUpController.clear();
+
+    if (app.iconConfig.isNotEmpty) {
+      try {
+        _iconConfig = IconConfig.fromJsonString(app.iconConfig);
+      } catch (_) {
+        _iconConfig = IconConfig.defaultFor(app.name);
+      }
+    } else {
+      _iconConfig = IconConfig.fromLegacy(
+        emoji: app.emoji, emojiScale: app.emojiScale,
+        emojiOffsetX: app.emojiOffsetX, emojiOffsetY: app.emojiOffsetY,
+        appName: app.name,
+      );
+    }
+
+    final type = app.appType.isNotEmpty ? app.appType
+        : app.templateId.isNotEmpty ? 'demo'
+        : app.description.startsWith('Web app: ') ? 'web' : 'ai';
+
+    if (type == 'web') {
+      _urlController.text = app.description.replaceFirst('Web app: ', '');
+      _urlError = null;
+      setState(() => _mode = 'web');
+    } else if (type == 'demo') {
+      _selectedDemoId = app.templateId;
+      setState(() => _mode = 'demo');
+    } else {
+      _promptVisible = app.prompt.isNotEmpty;
+      _htmlExpanded = true;
+      _descExpanded = true;
+      setState(() => _mode = 'ai');
+    }
+  }
+
+  void _reset() {
+    setState(() {
+      _mode = null;
+      _isBuilding = false;
+      _showBuildLog = false;
+      _nameController.clear();
+      _urlController.clear(); _urlError = null;
+      _descController.clear();
+      _htmlController.clear();
+      _generatedPrompt = '';
+      _editingId = null;
+      _existingPackageName = null;
+      _firebaseConfig = '';
+      _selectedDemoId = null;
+      _iconConfig = IconConfig();
+      _descExpanded = true;
+      _promptVisible = false;
+      _promptExpanded = false;
+      _promptCopied = false;
+      _htmlExpanded = false;
+      _genMethod = '';
+      _conversation.clear();
+      _aiGenerating = false;
+      _selectedHtml = null;
+      _followUpController.clear();
+      _log.clear();
+    });
+  }
+
+  IconConfig _ensureIconConfig(String label) {
+    if (_iconConfig.elements.isEmpty) _iconConfig = IconConfig.defaultFor(label);
+    return _iconConfig;
+  }
+
+  Future<void> _openIconEditor() async {
+    _ensureIconConfig(_nameController.text.trim());
+    final result = await Navigator.push<IconConfig>(
+      context, MaterialPageRoute(builder: (_) => IconEditorScreen(config: _iconConfig)),
+    );
+    if (result != null) setState(() => _iconConfig = result);
+  }
+
+  String _stripMarkdownFences(String text) {
+    var s = text.trim();
+    final m = RegExp(r'^```(?:html)?\s*\n?([\s\S]*?)\n?\s*```$').firstMatch(s);
+    if (m != null) s = m.group(1)!.trim();
+    final i = s.indexOf('<');
+    if (i > 0) s = s.substring(i);
+    return s;
+  }
+
+  Future<DateTime?> _getExistingCreatedAt(String id) async {
+    try { return (await AppStorage.loadAll()).firstWhere((a) => a.id == id).createdAt; }
+    catch (_) { return null; }
+  }
+
+  Future<void> _loadActiveProvider() async {
+    _loadingProvider = true;
+    try {
+      _activeProvider = await Settings.getActiveProvider();
+    } catch (_) {
+      _activeProvider = null;
+    }
+    _loadingProvider = false;
+    if (mounted) setState(() {});
+  }
+
+  /// Called when the Create tab becomes visible (e.g. after Settings change).
+  void refreshProvider() => _loadActiveProvider();
+
+  bool get isEditing => _isEditing;
+  bool get hasMode => _mode != null;
+  bool get isShowingBuildLog => _showBuildLog;
+
+  void dismissBuildLog() {
+    if (!_isBuilding) setState(() => _showBuildLog = false);
+  }
+
+  /// Called when user taps the Create tab while already on it or from another tab while editing.
+  void handleCreateTap() {
+    if (_editingId != null || _mode != null) {
+      _confirmExit(_reset);
+    }
+  }
+
+  /// When editing an existing app via API, seed the conversation with the current code
+  /// so the user can ask for changes directly without re-generating from scratch.
+  void _startEditConversation() {
+    final existingHtml = _htmlController.text.trim();
+    if (existingHtml.isEmpty || !existingHtml.startsWith('<')) return;
+    setState(() {
+      _genMethod = 'api';
+      _conversation = [
+        ChatMessage(role: 'assistant', content: existingHtml),
+      ];
+      _selectedHtml = existingHtml;
+    });
+  }
+
+  Future<void> _generateWithAI(AiProvider provider) async {
+    final name = _nameController.text.trim();
+    final desc = _descController.text.trim();
+    if (name.isEmpty || desc.isEmpty) { _snack('请填写名称和描述。'); return; }
+
+    final thisGenId = ++_genId;
+    setState(() {
+      _genMethod = 'api';
+      _aiGenerating = true; _genStartTime = DateTime.now();
+      _conversation = [ChatMessage(role: 'user', content: '应用名称：$name\n描述：$desc')];
+    });
+
+    try {
+      final systemPrompt = await PromptBuilder.getSystemPrompt();
+      final response = await AiService.generate(
+        provider: provider,
+        systemPrompt: systemPrompt,
+        messages: _conversation,
+      );
+      if (!mounted || thisGenId != _genId) return;
+      final cleaned = _stripMarkdownFences(response);
+      setState(() {
+        _conversation.add(ChatMessage(role: 'assistant', content: cleaned));
+        _aiGenerating = false;
+      });
+      if (cleaned.trim().startsWith('<')) _useThisHtml(cleaned);
+    } catch (e) {
+      if (!mounted || thisGenId != _genId) return;
+      setState(() => _aiGenerating = false);
+      _snack(friendlyError(e.toString()).toString());
+    }
+  }
+
+  Future<void> _sendFollowUp() async {
+    final msg = _followUpController.text.trim();
+    if (msg.isEmpty || _activeProvider == null) return;
+
+    final thisGenId = ++_genId;
+    final provider = _activeProvider!;
+    setState(() {
+      _conversation.add(ChatMessage(role: 'user', content: msg));
+      _followUpController.clear();
+      _aiGenerating = true; _genStartTime = DateTime.now();
+    });
+
+    try {
+      final systemPrompt = await PromptBuilder.getSystemPrompt();
+      final response = await AiService.generate(
+        provider: provider,
+        systemPrompt: systemPrompt,
+        messages: _conversation,
+      );
+      if (!mounted || thisGenId != _genId) return;
+      final cleaned = _stripMarkdownFences(response);
+      setState(() {
+        _conversation.add(ChatMessage(role: 'assistant', content: cleaned));
+        _aiGenerating = false;
+      });
+      if (cleaned.trim().startsWith('<')) _useThisHtml(cleaned);
+    } catch (e) {
+      if (!mounted || thisGenId != _genId) return;
+      setState(() => _aiGenerating = false);
+      _snack(friendlyError(e.toString()).toString());
+    }
+  }
+
+  bool get _hasUnsavedChanges {
+    if (_selectedHtml == null) return false;
+    // If editing and the HTML matches what's saved, no unsaved changes
+    if (_editingId != null && _selectedHtml == _htmlController.text.trim()) return false;
+    // If conversation produced HTML that hasn't been built
+    return _conversation.any((m) => m.role == 'assistant' && m.content.trim().startsWith('<'));
+  }
+
+  bool get _isEditing => _editingId != null;
+
+  Future<void> _confirmExit(VoidCallback onConfirm) async {
+    if (!_hasUnsavedChanges && !_isEditing) { onConfirm(); return; }
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A2E),
+        title: const Text('放弃更改？'),
+        content: Text(_isEditing
+          ? '你正在编辑${_nameController.text.trim().isNotEmpty ? _nameController.text.trim() : '这个应用'}。放弃并重新开始？'
+          : '你有未保存的更改。放弃并重新开始？'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          TextButton(onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('放弃更改', style: TextStyle(color: Color(0xFFFF6B6B)))),
+        ],
+      ),
+    );
+    if (result == true && mounted) onConfirm();
+  }
+
+  void _useThisHtml(String html) {
+    setState(() {
+      _selectedHtml = html;
+      _htmlController.text = html;
+      _htmlExpanded = false;
+    });
+    _snack('HTML已加载。可预览或构建。');
+    Future.delayed(const Duration(milliseconds: 300), () {
+      if (_formScrollController.hasClients) {
+        _formScrollController.animateTo(
+          _formScrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 400),
+          curve: Curves.easeOut,
+        );
+      }
+    });
+  }
+
+  static const _channel = MethodChannel('com.iappyx.container/generator');
+
+  Future<void> _voiceInput() async {
+    try {
+      final result = await _channel.invokeMethod<String>('speechToText');
+      if (result != null && result.isNotEmpty && mounted) {
+        setState(() {
+          _descController.text = _descController.text.isEmpty
+            ? result
+            : '${_descController.text} $result';
+          _descController.selection = TextSelection.collapsed(offset: _descController.text.length);
+        });
+      }
+    } catch (e) {
+      _snack('语音识别不可用');
+    }
+  }
+
+  void _snack(String msg) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg, style: const TextStyle(color: Colors.white)),
+        backgroundColor: const Color(0xFF1A1A2E), duration: const Duration(seconds: 4)));
+  }
+
+  // ── Builds ──
+
+  Future<void> _buildWebApp() async {
+    final label = _nameController.text.trim();
+    final url = _urlController.text.trim();
+    if (label.isEmpty || url.isEmpty) { _snack('请填写名称和 URL。'); return; }
+    if (label.length > 37 || label.codeUnits.length > 37) { _snack('名称过长（最多 37 个字符）。'); return; }
+    if (!url.startsWith('http://') && !url.startsWith('https://')) { _snack('URL 必须以 http:// 或 https:// 开头'); return; }
+    final safeLabel = label.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    final safeUrl = url.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('<', '\\x3c');
+    final html = '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>$safeLabel</title><style>*{margin:0;padding:0}body{background:#0d0d1a;display:flex;align-items:center;justify-content:center;height:100vh;font-family:-apple-system,sans-serif}.loader{color:#4FC3F7;font-size:14px}.spinner{width:24px;height:24px;border:3px solid #1a1a2e;border-top-color:#4FC3F7;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 12px}@keyframes spin{to{transform:rotate(360deg)}}</style></head><body><div class="loader"><div class="spinner"></div>Loading...</div><script>window.location.href="$safeUrl";</script></body></html>';
+    await _doBuild(label, html, 'web', description: 'Web app: $url');
+  }
+
+  Future<void> _buildAiApp() async {
+    final label = _nameController.text.trim();
+    final html = _htmlController.text.trim();
+    if (label.isEmpty || html.isEmpty) { _snack('请填写名称并粘贴 HTML。'); return; }
+    if (label.length > 37 || label.codeUnits.length > 37) { _snack('名称过长（最多 37 个字符）。'); return; }
+    if (!html.startsWith('<')) { _snack('HTML 必须以 < 开头（例如 <!DOCTYPE html>）。'); return; }
+    await _doBuild(label, html, 'ai', description: _descController.text.trim(), prompt: _generatedPrompt);
+  }
+
+  Future<void> _buildDemo() async {
+    if (_selectedDemoId == null) return;
+    final t = h.demoTemplates.where((t) => t.$1 == _selectedDemoId).firstOrNull;
+    if (t == null) { _snack('未找到演示模板。'); return; }
+    final label = _nameController.text.trim().isNotEmpty ? _nameController.text.trim() : t.$3;
+    if (label.length > 37 || label.codeUnits.length > 37) { _snack('名称过长（最多 37 个字符）。'); return; }
+    if (_iconConfig.elements.isEmpty) {
+      _iconConfig = IconConfig(bgColor: IconConfig.colorForString(t.$2), elements: [IconElement(content: t.$2)]);
+    }
+    if (_existingPackageName != null && _existingPackageName!.isNotEmpty) {
+      final ok = await Generator.handleSignatureConflict(packageName: _existingPackageName!, context: context);
+      if (!ok) return;
+    }
+    setState(() { _isBuilding = true; _showBuildLog = true; _log.clear(); });
+    try {
+      final result = await Generator.generateFromTemplate(label: label, templateId: t.$1, packageName: _existingPackageName, iconConfig: _iconConfig.toJsonString(), onProgress: _addLog);
+      final now = DateTime.now();
+      final appId = _editingId ?? '${now.millisecondsSinceEpoch}_${Random().nextInt(9999)}';
+      await AppStorage.save(AppData(
+        id: appId, name: label,
+        description: '演示：${t.$4}', prompt: '', html: '', appType: 'demo', templateId: t.$1,
+        packageName: result.packageName, apkPath: result.apkPath, iconConfig: _iconConfig.toJsonString(),
+        createdAt: _editingId != null ? (await _getExistingCreatedAt(_editingId!) ?? now) : now, updatedAt: now,
+      ));
+      _editingId = appId;
+      _existingPackageName = result.packageName;
+      _addLog('\u2705构建完成！应用已保存。');
+      widget.onAppSaved?.call();
+    } on PlatformException catch (e) {
+      if (e.message != null && e.message!.contains('SIGNATURE_CONFLICT:')) {
+        final pkg = e.message!.split('SIGNATURE_CONFLICT:').last;
+        _addLog('\u26A0应用已由其他设备签名。请先卸载旧版本。');
+        final ok = await Generator.handleSignatureConflict(packageName: pkg, context: context);
+        if (ok) _addLog('旧版本已移除。点击“构建”重新安装。');
+      } else {
+        final err = friendlyError(e.message); _addLog('\u274C ${err.message}'); if (err.hint != null) _addLog('   ${err.hint}');
+      }
+    } catch (e) {
+      _addLog('\u274C意外错误：$e');
+    }
+    finally { if (mounted) setState(() => _isBuilding = false); }
+  }
+
+  Future<void> _doBuild(String label, String html, String appType, {String description = '', String prompt = ''}) async {
+    if (_existingPackageName != null && _existingPackageName!.isNotEmpty) {
+      final ok = await Generator.handleSignatureConflict(packageName: _existingPackageName!, context: context);
+      if (!ok) return;
+    }
+    setState(() { _isBuilding = true; _showBuildLog = true; _log.clear(); });
+    try {
+      // Save old version before rebuilding
+      if (_editingId != null) {
+        final existing = (await AppStorage.loadAll()).where((a) => a.id == _editingId).toList();
+        if (existing.isNotEmpty && existing.first.html.isNotEmpty && existing.first.html != html) {
+          await AppStorage.saveVersion(_editingId!, existing.first.html);
+        }
+      }
+      final ic = _ensureIconConfig(label);
+      // If a showcase app was loaded with resources, move the temp bundle to the real appId
+      final appId = _editingId ?? '${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(9999)}';
+      if (_pendingShowcaseBundleId != null && _editingId == null) {
+        // First build of a showcase app — move temp bundle to the new appId
+        final tempFiles = await BundleStorage.readAll(_pendingShowcaseBundleId!);
+        for (final entry in tempFiles.entries) {
+          await BundleStorage.addFile(appId, entry.key, entry.value);
+        }
+        await BundleStorage.clearBundle(_pendingShowcaseBundleId!);
+        _pendingShowcaseBundleId = null;
+        _editingId = appId; // set early so bundlePaths picks it up
+      }
+      final bundlePaths = await BundleStorage.paths(appId);
+      final result = await Generator.injectHtml(label: label, htmlContent: html, packageName: _existingPackageName, iconConfig: ic.toJsonString(), firebaseConfig: _firebaseConfig.isNotEmpty ? _firebaseConfig : null, onProgress: _addLog, webOnly: appType == 'web', bundleFiles: bundlePaths);
+      final now = DateTime.now();
+      await AppStorage.save(AppData(
+        id: appId, name: label,
+        description: description, prompt: prompt, html: AppStorage.tagHtml(html), appType: appType,
+        packageName: result.packageName, apkPath: result.apkPath, iconConfig: ic.toJsonString(), firebaseConfig: _firebaseConfig,
+        createdAt: _editingId != null ? (await _getExistingCreatedAt(_editingId!) ?? now) : now, updatedAt: now,
+      ));
+      _editingId = appId;
+      _existingPackageName = result.packageName;
+      _addLog('\u2705构建完成！应用已保存。');
+      widget.onAppSaved?.call();
+    } on PlatformException catch (e) {
+      if (e.message != null && e.message!.contains('SIGNATURE_CONFLICT:')) {
+        final pkg = e.message!.split('SIGNATURE_CONFLICT:').last;
+        _addLog('\u26A0应用已由其他设备签名。请先卸载旧版本。');
+        final ok = await Generator.handleSignatureConflict(packageName: pkg, context: context);
+        if (ok) _addLog('旧版本已移除。点击“构建”重新安装。');
+      } else {
+        final err = friendlyError(e.message); _addLog('\u274C ${err.message}'); if (err.hint != null) _addLog('   ${err.hint}');
+      }
+    } catch (e) {
+      _addLog('\u274C意外错误：$e');
+    }
+    finally { if (mounted) setState(() => _isBuilding = false); }
+  }
+
+  Future<void> _loadBundleFiles() async {
+    if (_editingId == null) return;
+    final files = await BundleStorage.listFiles(_editingId!);
+    if (mounted) setState(() => _bundleFiles = files);
+  }
+
+  Future<void> _addBundleFile() async {
+    final appId = _editingId;
+    if (appId == null) { _snack('请先保存应用，再添加文件。'); return; }
+    final r = await FilePicker.platform.pickFiles(type: FileType.any);
+    if (r == null || r.files.single.path == null) return;
+    final picked = File(r.files.single.path!);
+    var name = r.files.single.name;
+    // Sanitize filename
+    name = name.replaceAll(RegExp(r'[^\w.\-]'), '_');
+    if (name.length > 100) name = name.substring(0, 100);
+    final bytes = await picked.readAsBytes();
+    if (bytes.length > 100 * 1024 * 1024) { _snack('文件过大（最大 100 MB）。'); return; }
+    await BundleStorage.addFile(appId, name, bytes);
+    await _loadBundleFiles();
+    _snack('已添加 $name（${(bytes.length / 1024).toStringAsFixed(0)} KB）');
+  }
+
+  Future<void> _removeBundleFile(String name) async {
+    if (_editingId == null) return;
+    await BundleStorage.removeFile(_editingId!, name);
+    await _loadBundleFiles();
+  }
+
+  String _bundleTotalSize() {
+    int total = 0;
+    for (final f in _bundleFiles) total += f['size'] as int;
+    if (total < 1024) return '$total B';
+    if (total < 1024 * 1024) return '${(total / 1024).toStringAsFixed(1)} KB';
+    return '${(total / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  Future<void> _generatePrompt() async {
+    final name = _nameController.text.trim();
+    final desc = _descController.text.trim();
+    if (name.isEmpty || desc.isEmpty) { _snack('请填写名称和描述。'); return; }
+    try {
+      final existingHtml = _editingId != null ? _htmlController.text.trim() : null;
+      _generatedPrompt = await PromptBuilder.buildPrompt(appName: name, description: desc, existingHtml: existingHtml);
+      _generatedLinkedPrompt = await PromptBuilder.buildLinkedPrompt(appName: name, description: desc, existingHtml: existingHtml);
+      setState(() { _promptVisible = true; _promptExpanded = true; _descExpanded = false; _htmlExpanded = true; });
+    } catch (e) { _snack('提示词生成失败：$e'); }
+  }
+
+  // ── UI ──
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: SafeArea(
+        child: _showBuildLog ? _buildingView() : _mode == null ? _modeSelection() : _mode == 'showcase' ? _showcaseView() : _formView(),
+      ),
+    );
+  }
+
+  Widget _advancedSettings() {
+    if (_existingPackageName == null || _existingPackageName!.isEmpty) return const SizedBox.shrink();
+    return ExpansionTile(
+      title: const Text('高级设置', style: TextStyle(fontSize: 13, color: Colors.white54)),
+      tilePadding: EdgeInsets.zero,
+      childrenPadding: const EdgeInsets.only(bottom: 12),
+      iconColor: Colors.white38,
+      collapsedIconColor: Colors.white38,
+      children: [
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: const Color(0xFF0D0D1A),
+            borderRadius: BorderRadius.circular(10),
+          ),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const Text('包名', style: TextStyle(fontSize: 11, color: Colors.white38)),
+            const SizedBox(height: 4),
+            SelectableText(_existingPackageName!, style: const TextStyle(fontSize: 13, fontFamily: 'monospace', color: Color(0xFF4FC3F7))),
+            const SizedBox(height: 4),
+            const Text('在 Firebase 控制台添加 Android 应用时使用此名称。', style: TextStyle(fontSize: 10, color: Colors.white24)),
+            const SizedBox(height: 16),
+            const Text('Firebase 配置（可选）', style: TextStyle(fontSize: 11, color: Colors.white38)),
+            const SizedBox(height: 4),
+            const Text('启用推送通知。创建 Firebase 项目，使用上面的包名添加 Android 应用，然后下载 google-services.json。',
+              style: TextStyle(fontSize: 10, color: Colors.white24)),
+            const SizedBox(height: 8),
+            Row(children: [
+              GestureDetector(
+                onTap: () async {
+                  final result = await FilePicker.platform.pickFiles(type: FileType.any);
+                  if (result != null && result.files.single.path != null) {
+                    final file = File(result.files.single.path!);
+                    final content = await file.readAsString();
+                    if (content.contains('project_id') && content.contains('client')) {
+                      setState(() => _firebaseConfig = content);
+                    } else if (mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('google-services.json 无效')),
+                      );
+                    }
+                  }
+                },
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F3460),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    _firebaseConfig.isEmpty ? '选择 google-services.json' : '替换配置',
+                    style: const TextStyle(fontSize: 12, color: Color(0xFF4FC3F7)),
+                  ),
+                ),
+              ),
+              if (_firebaseConfig.isNotEmpty) ...[
+                const SizedBox(width: 8),
+                const Icon(Icons.check_circle, color: Color(0xFF69F0AE), size: 16),
+                const SizedBox(width: 4),
+                const Text('已配置', style: TextStyle(fontSize: 11, color: Color(0xFF69F0AE))),
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: () => setState(() => _firebaseConfig = ''),
+                  child: const Icon(Icons.close, color: Colors.white38, size: 16),
+                ),
+              ],
+            ]),
+          ]),
+        ),
+      ],
+    );
+  }
+
+  Widget _modeSelection() => SingleChildScrollView(
+    padding: const EdgeInsets.fromLTRB(24, 32, 24, 40),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      _appHeader('创建应用'),
+      const SizedBox(height: 32),
+      const Text('你想创建什么？', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+      const SizedBox(height: 20),
+      h.buildModeCard(icon: Icons.auto_awesome, title: 'AI 生成应用', subtitle: '描述你的需求，用 AI 生成', onTap: () => setState(() => _mode = 'ai')),
+      const SizedBox(height: 12),
+      h.buildModeCard(icon: Icons.language, title: '网站应用', subtitle: '将任意网站变成独立应用', onTap: () => setState(() => _mode = 'web')),
+      const SizedBox(height: 12),
+      h.buildModeCard(icon: Icons.storefront_outlined, title: '应用展示', subtitle: '社区应用——可直接构建', onTap: () => setState(() => _mode = 'showcase')),
+      const SizedBox(height: 12),
+      h.buildModeCard(icon: Icons.science_outlined, title: '演示应用', subtitle: '预构建应用，用于测试桥接功能', onTap: () => setState(() => _mode = 'demo')),
+    ]),
+  );
+
+  Widget _showcaseView() => Padding(
+    padding: const EdgeInsets.fromLTRB(24, 32, 24, 0),
+    child: ShowcaseScreen(onBack: () => setState(() => _mode = null), onLoadApp: (name, html, {String? bundleAppId}) {
+      _pendingShowcaseBundleId = bundleAppId;
+      _nameController.text = name;
+      _htmlController.text = html;
+      _descController.text = '展示应用：$name';
+      _selectedHtml = html;
+      _genMethod = 'manual';
+      _htmlExpanded = true;
+      _descExpanded = false;
+      setState(() => _mode = 'ai');
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('$name 已加载——可预览或构建'), backgroundColor: const Color(0xFF1A1A2E), duration: const Duration(seconds: 3)));
+      });
+    }),
+  );
+
+  Widget _formView() {
+    final isEdit = _editingId != null;
+    final label = _mode == 'web' ? '网站应用' : _mode == 'ai' ? 'AI 应用' : '演示应用';
+    return SingleChildScrollView(
+      controller: _formScrollController,
+      padding: const EdgeInsets.fromLTRB(24, 32, 24, 40),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        // Back + title
+        Row(children: [
+          GestureDetector(
+            onTap: () => _confirmExit(isEdit ? () => widget.onViewMyApps?.call() : _reset),
+            child: Container(
+              width: 38, height: 38,
+              decoration: BoxDecoration(color: const Color(0xFF1A1A2E), borderRadius: BorderRadius.circular(10)),
+              child: const Icon(Icons.arrow_back, size: 18, color: Colors.white54),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(isEdit ? '正在编辑' : '新建$label',
+                  style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              if (isEdit && _nameController.text.isNotEmpty)
+                Text(_nameController.text, style: const TextStyle(fontSize: 12, color: Colors.white38)),
+            ],
+          )),
+          GestureDetector(
+            onTap: () => _confirmExit(isEdit ? () => widget.onViewMyApps?.call() : _reset),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+              decoration: BoxDecoration(color: const Color(0xFF1A1A2E), borderRadius: BorderRadius.circular(8)),
+              child: const Text('取消', style: TextStyle(fontSize: 13, color: Colors.white54)),
+            ),
+          ),
+        ]),
+        const SizedBox(height: 24),
+
+        // Icon + Name
+        Row(crossAxisAlignment: CrossAxisAlignment.center, children: [
+          Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: _openIconEditor,
+              borderRadius: BorderRadius.circular(14),
+              child: Stack(children: [
+                IconPreview(config: _iconConfig.elements.isEmpty ? _ensureIconConfig(_nameController.text.trim()) : _iconConfig, size: 60),
+                Positioned(right: -2, bottom: -2, child: Container(
+                  width: 24, height: 24,
+                  decoration: BoxDecoration(color: const Color(0xFF4FC3F7), borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: const Color(0xFF0D0D1A), width: 2)),
+                  child: const Icon(Icons.edit, size: 12, color: Color(0xFF0D0D1A)),
+                )),
+              ]),
+            ),
+          ),
+          const SizedBox(width: 14),
+          Expanded(child: TextField(
+            controller: _nameController,
+            style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600),
+            decoration: const InputDecoration(hintText: '应用名称', contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 14)),
+            textCapitalization: TextCapitalization.words,
+          )),
+        ]),
+        const SizedBox(height: 20),
+
+        if (_mode == 'web') _webFields(),
+        if (_mode == 'ai') _aiFields(),
+        if (_mode == 'demo') _demoFields(),
+      ]),
+    );
+  }
+
+  // ── Web ──
+  void _validateUrl() {
+    final url = _urlController.text.trim();
+    setState(() {
+      if (url.isEmpty) { _urlError = null; }
+      else if (!url.startsWith('http://') && !url.startsWith('https://')) { _urlError = '必须以 http:// 或 https:// 开头'; }
+      else if (url == 'http://' || url == 'https://') { _urlError = '请输入完整的 URL'; }
+      else if (!url.contains('.')) { _urlError = '请输入有效的 URL'; }
+      else { _urlError = null; }
+    });
+  }
+
+  Widget _webFields() => Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+    const Text('URL', style: TextStyle(fontSize: 13, color: Colors.white54)),
+    const SizedBox(height: 8),
+    TextField(controller: _urlController, style: const TextStyle(color: Colors.white, fontSize: 14),
+      decoration: InputDecoration(hintText: 'https://example.com', errorText: _urlError),
+      keyboardType: TextInputType.url,
+      onChanged: (_) { if (_urlError != null) _validateUrl(); },
+      onEditingComplete: _validateUrl),
+    _advancedSettings(),
+    const SizedBox(height: 24),
+    h.buildActionButton(label: '构建应用', onPressed: _isBuilding ? null : _buildWebApp, icon: Icons.rocket_launch),
+  ]);
+
+  // ── AI ──
+  Widget _aiFields() {
+    if (_activeProvider == null && !_loadingProvider) _loadActiveProvider();
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      // Section 1: Describe
+      _section('描述你的应用', _descExpanded, () => setState(() => _descExpanded = !_descExpanded),
+        done: _genMethod.isNotEmpty || _generatedPrompt.isNotEmpty,
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const SizedBox(height: 8),
+          Stack(children: [
+            TextField(controller: _descController, style: const TextStyle(color: Colors.white), maxLines: 4,
+              decoration: const InputDecoration(hintText: '这个应用应该做什么？', contentPadding: EdgeInsets.fromLTRB(12, 12, 48, 12)),
+              textCapitalization: TextCapitalization.sentences),
+            Positioned(right: 4, bottom: 4, child: GestureDetector(
+              onTap: _voiceInput,
+              child: Container(
+                width: 36, height: 36,
+                decoration: BoxDecoration(color: const Color(0xFF0F3460), borderRadius: BorderRadius.circular(10)),
+                child: const Icon(Icons.mic, size: 18, color: Color(0xFF4FC3F7)),
+              ),
+            )),
+          ]),
+          const SizedBox(height: 16),
+          const Text('选择生成应用代码的方式。',
+              style: TextStyle(fontSize: 12, color: Colors.white38)),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: _genButton(
+              icon: Icons.content_paste,
+              label: 'AI 手动',
+              sublabel: '复制粘贴',
+              selected: _genMethod == 'manual',
+              onTap: () => setState(() => _genMethod = 'manual'),
+            )),
+            const SizedBox(width: 10),
+            Expanded(child: _genButton(
+              icon: Icons.auto_awesome,
+              label: 'AI API',
+              sublabel: _activeProvider != null && _activeProvider!.isConfigured
+                  ? _activeProvider!.selectedModel.split('/').last.split('-').take(3).join('-')
+                  : '点击设置',
+              selected: _genMethod == 'api',
+              onTap: () async {
+                if (_activeProvider == null || !_activeProvider!.isConfigured) {
+                  final provider = _activeProvider ?? AiProvider.anthropic();
+                  final result = await Navigator.push<AiProvider>(
+                    context,
+                    MaterialPageRoute(builder: (_) => ProviderSetupPage(provider: provider)),
+                  );
+                  if (result != null && result.isConfigured) {
+                    await Settings.setActiveProvider(result);
+                    _activeProvider = result;
+                  } else {
+                    await _loadActiveProvider();
+                  }
+                  if (_activeProvider == null || !_activeProvider!.isConfigured) return;
+                }
+                setState(() => _genMethod = 'api');
+              },
+            )),
+          ]),
+          if (_genMethod.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            if (_genMethod == 'manual')
+              const Padding(padding: EdgeInsets.only(bottom: 10),
+                child: Text('这将生成一份包含全部技术说明的详细提示词。把提示词复制到任意 AI 助手，然后将它返回的 HTML 代码粘贴回这里。',
+                  style: TextStyle(fontSize: 11, color: Colors.white38)))
+            else if (_genMethod == 'api')
+              Padding(padding: const EdgeInsets.only(bottom: 10),
+                child: Text('你的应用描述将连同技术文档一起发送给 ${_activeProvider?.selectedModel.split('/').last ?? "AI"}。响应会显示在下方。',
+                  style: const TextStyle(fontSize: 11, color: Colors.white38))),
+            if (_genMethod == 'api' && _editingId != null && _htmlController.text.trim().startsWith('<') && _conversation.isEmpty)
+              h.buildActionButton(
+                label: '用 AI 编辑',
+                icon: Icons.edit,
+                onPressed: _startEditConversation,
+              )
+            else
+              h.buildActionButton(
+                label: _genMethod == 'api' ? '生成' : (_editingId != null ? '生成更新提示词' : '为 AI 生成提示词'),
+                icon: _genMethod == 'api' ? Icons.auto_awesome : Icons.content_paste,
+                onPressed: _aiGenerating ? null : () {
+                  if (_genMethod == 'manual') {
+                    _generatePrompt();
+                  } else if (_activeProvider != null && _activeProvider!.isConfigured) {
+                    _generateWithAI(_activeProvider!);
+                  }
+                },
+              ),
+          ],
+        ]),
+      ),
+
+      // Section 2a: AI Conversation (when using API)
+      if (_genMethod == 'api' && _conversation.isNotEmpty) ...[
+        const SizedBox(height: 10),
+        _section('AI 对话', true, () {},
+          done: _selectedHtml != null,
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const SizedBox(height: 8),
+            const Text('使用下方的输入框提出修改要求。每条消息都会包含完整的对话历史。',
+                style: TextStyle(fontSize: 11, color: Colors.white38)),
+            const SizedBox(height: 8),
+            // Messages
+            ..._conversation.map((msg) => _chatBubble(msg)),
+            if (_aiGenerating)
+              _generatingIndicator(),
+            if (!_aiGenerating && _conversation.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Row(children: [
+                Expanded(child: TextField(
+                  controller: _followUpController,
+                  style: const TextStyle(color: Colors.white, fontSize: 13),
+                  decoration: InputDecoration(hintText: _editingId != null ? '需要修改什么？' : '提出修改要求...', contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12)),
+                  onSubmitted: (_) => _sendFollowUp(),
+                )),
+                const SizedBox(width: 8),
+                GestureDetector(
+                  onTap: _sendFollowUp,
+                  child: Container(
+                    width: 44, height: 44,
+                    decoration: BoxDecoration(color: const Color(0xFF0F3460), borderRadius: BorderRadius.circular(12)),
+                    child: const Icon(Icons.send, size: 18, color: Color(0xFF4FC3F7)),
+                  ),
+                ),
+              ]),
+            ],
+          ]),
+        ),
+      ],
+
+      // Section 2b: Manual copy-paste (when using manual)
+      if (_genMethod == 'manual') ...[
+        if (_promptVisible) ...[
+          const SizedBox(height: 10),
+          _section('将提示词复制给 AI', _promptExpanded, () => setState(() => _promptExpanded = !_promptExpanded), done: _promptCopied,
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              const SizedBox(height: 8),
+              const Text('将此提示词发送给 AI 助手。提示词中包含桥接文档和你的应用描述。',
+                  style: TextStyle(fontSize: 11, color: Colors.white38)),
+              const SizedBox(height: 10),
+              // Variant toggle — Full (works anywhere) vs Linked (short, needs an AI that can fetch URLs).
+              Row(children: [
+                Expanded(child: GestureDetector(
+                  onTap: () => setState(() => _promptVariant = 'full'),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    decoration: BoxDecoration(
+                      color: _promptVariant == 'full' ? const Color(0xFF1E3A5F) : const Color(0xFF0A0A14),
+                      borderRadius: const BorderRadius.horizontal(left: Radius.circular(8)),
+                      border: Border.all(color: _promptVariant == 'full' ? const Color(0xFF4FC3F7) : const Color(0xFF222232)),
+                    ),
+                    child: Center(child: Text('完整版 (${(_generatedPrompt.length / 1024).toStringAsFixed(1)} KB)',
+                        style: TextStyle(fontSize: 11, color: _promptVariant == 'full' ? Colors.white : Colors.white54))),
+                  ),
+                )),
+                Expanded(child: GestureDetector(
+                  onTap: () => setState(() => _promptVariant = 'linked'),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    decoration: BoxDecoration(
+                      color: _promptVariant == 'linked' ? const Color(0xFF1E3A5F) : const Color(0xFF0A0A14),
+                      borderRadius: const BorderRadius.horizontal(right: Radius.circular(8)),
+                      border: Border.all(color: _promptVariant == 'linked' ? const Color(0xFF4FC3F7) : const Color(0xFF222232)),
+                    ),
+                    child: Center(child: Text('链接版 (${(_generatedLinkedPrompt.length / 1024).toStringAsFixed(1)} KB)',
+                        style: TextStyle(fontSize: 11, color: _promptVariant == 'linked' ? Colors.white : Colors.white54))),
+                  ),
+                )),
+              ]),
+              const SizedBox(height: 6),
+              Text(
+                _promptVariant == 'full'
+                  ? '完整版提示词适用于任何 AI，但体积较大。'
+                  : '链接版提示词较短，指向托管的 Spec。适用于 Claude.ai、ChatGPT（联网浏览）、Gemini。',
+                style: const TextStyle(fontSize: 10, color: Colors.white38),
+              ),
+              const SizedBox(height: 8),
+              Container(
+                width: double.infinity, constraints: const BoxConstraints(maxHeight: 180),
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(color: const Color(0xFF0A0A14), borderRadius: BorderRadius.circular(10)),
+                child: SingleChildScrollView(child: Text(
+                  _promptVariant == 'full' ? _generatedPrompt : _generatedLinkedPrompt,
+                  style: const TextStyle(fontSize: 10, fontFamily: 'monospace', color: Colors.white38))),
+              ),
+              const SizedBox(height: 10),
+              Row(children: [
+                Expanded(child: h.buildActionButton(label: '复制', icon: Icons.copy, onPressed: () {
+                  final text = _promptVariant == 'full' ? _generatedPrompt : _generatedLinkedPrompt;
+                  Clipboard.setData(ClipboardData(text: text));
+                  setState(() { _promptCopied = true; _promptExpanded = false; });
+                  _snack('已复制！请粘贴到你的 AI 助手中。');
+                })),
+                const SizedBox(width: 10),
+                Expanded(child: h.buildActionButton(label: '分享', icon: Icons.share, secondary: true, onPressed: () {
+                  final text = _promptVariant == 'full' ? _generatedPrompt : _generatedLinkedPrompt;
+                  final name = _nameController.text.trim().replaceAll(RegExp(r'[^\w]'), '_').toLowerCase();
+                  Generator.shareText(content: text, filename: '${name.isEmpty ? "prompt" : name}_prompt.txt');
+                  setState(() { _promptCopied = true; });
+                })),
+              ]),
+              const SizedBox(height: 8),
+              h.buildActionButton(label: '保存到下载', icon: Icons.download, secondary: true, onPressed: () async {
+                try {
+                  final text = _promptVariant == 'full' ? _generatedPrompt : _generatedLinkedPrompt;
+                  final name = _nameController.text.trim().replaceAll(RegExp(r'[^\w]'), '_').toLowerCase();
+                  final filename = '${name.isEmpty ? "prompt" : name}_prompt.txt';
+                  final dir = Directory('/storage/emulated/0/Download');
+                  if (!dir.existsSync()) dir.createSync(recursive: true);
+                  final file = File('${dir.path}/$filename');
+                  file.writeAsStringSync(text);
+                  setState(() { _promptCopied = true; });
+                  _snack('已保存到 Downloads/$filename');
+                } catch (e) {
+                  _snack('保存失败：$e');
+                }
+              }),
+            ]),
+          ),
+        ],
+        const SizedBox(height: 10),
+        _section('粘贴 AI 的回复', _htmlExpanded, () => setState(() => _htmlExpanded = !_htmlExpanded),
+          done: _htmlController.text.trim().startsWith('<'),
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const SizedBox(height: 8),
+            const Text('从 AI 回复中粘贴 HTML 代码。代码应该是完整的 HTML 文件，并以 <!DOCTYPE html> 开头。',
+                style: TextStyle(fontSize: 11, color: Colors.white38)),
+            const SizedBox(height: 8),
+            TextField(controller: _htmlController, style: const TextStyle(fontSize: 11, fontFamily: 'monospace', color: Colors.white),
+              maxLines: 8, decoration: const InputDecoration(hintText: '在此粘贴 HTML...', hintStyle: TextStyle(fontFamily: 'monospace'))),
+            const SizedBox(height: 10),
+            Row(children: [
+              Expanded(child: OutlinedButton.icon(
+                onPressed: () async {
+                  final d = await Clipboard.getData(Clipboard.kTextPlain);
+                  if (!mounted) return;
+                  if (d?.text != null) { _htmlController.text = _stripMarkdownFences(d!.text!); setState(() {}); }
+                },
+                icon: const Icon(Icons.paste, size: 16), label: const Text('粘贴'),
+                style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFF4FC3F7), side: const BorderSide(color: Color(0xFF4FC3F7)),
+                  padding: const EdgeInsets.symmetric(vertical: 12), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+              )),
+              const SizedBox(width: 10),
+              Expanded(child: OutlinedButton.icon(
+                onPressed: () async {
+                  final r = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['html', 'htm', 'txt']);
+                  if (!mounted) return;
+                  if (r != null && r.files.single.path != null) { _htmlController.text = _stripMarkdownFences(await File(r.files.single.path!).readAsString()); if (mounted) setState(() {}); }
+                },
+                icon: const Icon(Icons.file_open, size: 16), label: const Text('文件'),
+                style: OutlinedButton.styleFrom(foregroundColor: const Color(0xFF4FC3F7), side: const BorderSide(color: Color(0xFF4FC3F7)),
+                  padding: const EdgeInsets.symmetric(vertical: 12), shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10))),
+              )),
+            ]),
+          ]),
+        ),
+      ],
+
+      // App Files — optional bundled data files (databases, JSON, images, etc.)
+      if (_editingId != null) ...[
+        const SizedBox(height: 6),
+        _section(
+          '应用文件${_bundleFiles.isNotEmpty ? ' (${_bundleFiles.length} 个文件${_bundleFiles.length == 1 ? '' : ''}, ${_bundleTotalSize()})' : ''}',
+          _bundleExpanded,
+          () { setState(() => _bundleExpanded = !_bundleExpanded); if (_bundleExpanded && _bundleFiles.isEmpty) _loadBundleFiles(); },
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const SizedBox(height: 8),
+            const Text('添加要打包进 APK 的文件（数据库、JSON、图片）。运行时可通过 iappyx.storage.readAsset() 或 extractAsset() 访问。',
+                style: TextStyle(fontSize: 11, color: Colors.white38)),
+            const SizedBox(height: 10),
+            if (_bundleFiles.isEmpty)
+              const Padding(padding: EdgeInsets.symmetric(vertical: 12),
+                child: Center(child: Text('尚未添加文件', style: TextStyle(fontSize: 12, color: Colors.white24))))
+            else
+              ...List.generate(_bundleFiles.length, (i) {
+                final f = _bundleFiles[i];
+                final name = f['name'] as String;
+                final size = f['size'] as int;
+                final sizeStr = size < 1024 ? '$size B' : size < 1024 * 1024 ? '${(size / 1024).toStringAsFixed(0)} KB' : '${(size / (1024 * 1024)).toStringAsFixed(1)} MB';
+                return Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                    decoration: BoxDecoration(color: const Color(0xFF0A0A14), borderRadius: BorderRadius.circular(8)),
+                    child: Row(children: [
+                      const Icon(Icons.insert_drive_file, size: 16, color: Color(0xFF4FC3F7)),
+                      const SizedBox(width: 8),
+                      Expanded(child: Text(name, style: const TextStyle(fontSize: 12, color: Colors.white70), overflow: TextOverflow.ellipsis)),
+                      Text(sizeStr, style: const TextStyle(fontSize: 11, color: Colors.white30)),
+                      const SizedBox(width: 8),
+                      GestureDetector(
+                        onTap: () => _removeBundleFile(name),
+                        child: const Icon(Icons.close, size: 16, color: Color(0xFFFF6B6B)),
+                      ),
+                    ]),
+                  ),
+                );
+              }),
+            const SizedBox(height: 8),
+            h.buildActionButton(label: '+ 添加文件', icon: Icons.add, secondary: true, onPressed: _addBundleFile),
+            if (_bundleFiles.fold<int>(0, (sum, f) => sum + (f['size'] as int)) > 10 * 1024 * 1024)
+              const Padding(padding: EdgeInsets.only(top: 6),
+                child: Text('文件过多会增加 APK 体积（文件以未压缩形式存储在 APK 中）。',
+                  style: TextStyle(fontSize: 10, color: Color(0xFFFF8A65)))),
+          ]),
+        ),
+      ],
+
+      _advancedSettings(),
+
+      // Section: Preview & Build (both flows)
+      if (_htmlController.text.trim().startsWith('<') || _selectedHtml != null) ...[
+        const SizedBox(height: 10),
+        _section('预览与构建', true, () {},
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            const SizedBox(height: 8),
+            const Text('预览会在测试环境中运行应用。“保存并构建 APK”会在你的设备上生成可安装的 APK。',
+                style: TextStyle(fontSize: 11, color: Colors.white38)),
+            const SizedBox(height: 8),
+            h.buildActionButton(label: '预览', icon: Icons.visibility, onPressed: _htmlController.text.trim().isEmpty ? null : () {
+              Navigator.push(context, MaterialPageRoute(builder: (_) => PreviewScreen(htmlContent: _htmlController.text.trim())));
+            }),
+            const SizedBox(height: 10),
+            h.buildActionButton(label: '保存并构建 APK', icon: Icons.build, onPressed: _isBuilding ? null : _buildAiApp, secondary: true),
+          ]),
+        ),
+      ],
+    ]);
+  }
+
+  Widget _genButton({required IconData icon, required String label, required String sublabel, required bool selected, required VoidCallback onTap}) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF0F3460) : const Color(0xFF1A1A2E),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: selected ? const Color(0xFF4FC3F7) : Colors.white12),
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            Icon(icon, size: 16, color: selected ? const Color(0xFF4FC3F7) : Colors.white38),
+            const SizedBox(width: 8),
+            Text(label, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600,
+                color: selected ? Colors.white : Colors.white54)),
+          ]),
+          const SizedBox(height: 3),
+          Text(sublabel, style: TextStyle(fontSize: 10, color: selected ? Colors.white38 : Colors.white24)),
+        ]),
+      ),
+    );
+  }
+
+  Widget _generatingIndicator() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: StreamBuilder(
+        stream: Stream.periodic(const Duration(seconds: 1)),
+        builder: (context, _) {
+          final elapsed = _genStartTime != null
+              ? DateTime.now().difference(_genStartTime!).inSeconds
+              : 0;
+          return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Row(children: [
+              const SizedBox(width: 16, height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF4FC3F7))),
+              const SizedBox(width: 10),
+              Text('正在生成... ${elapsed}s',
+                  style: const TextStyle(fontSize: 12, color: Colors.white38)),
+              const Spacer(),
+              GestureDetector(
+                onTap: () => setState(() {
+                  _genId++;
+                  _aiGenerating = false;
+                  _genStartTime = null;
+                }),
+                child: const Text('取消', style: TextStyle(fontSize: 12, color: Color(0xFFFF6B6B))),
+              ),
+            ]),
+            if (elapsed > 60)
+              const Padding(
+                padding: EdgeInsets.only(left: 26, top: 6),
+                child: Text('耗时比平时更长。你可以取消后重试。',
+                  style: TextStyle(fontSize: 11, color: Colors.white24)),
+              ),
+          ]);
+        },
+      ),
+    );
+  }
+
+  Widget _chatBubble(ChatMessage msg) {
+    final isUser = msg.role == 'user';
+    final isHtml = !isUser && msg.content.trim().startsWith('<');
+    return Container(
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: isUser ? const Color(0xFF0F3460) : const Color(0xFF0A0A14),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [
+          Text(isUser ? '你' : 'AI', style: TextStyle(fontSize: 10, fontWeight: FontWeight.w600,
+              color: isUser ? const Color(0xFF4FC3F7) : const Color(0xFF69F0AE))),
+          const Spacer(),
+          if (isHtml)
+            GestureDetector(
+              onTap: () => _useThisHtml(msg.content),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: _selectedHtml == msg.content ? const Color(0xFF1B5E20) : const Color(0xFF0F3460),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Row(mainAxisSize: MainAxisSize.min, children: [
+                  if (_selectedHtml == msg.content) const Icon(Icons.check, size: 12, color: Color(0xFF69F0AE)),
+                  if (_selectedHtml == msg.content) const SizedBox(width: 4),
+                  Text(_selectedHtml == msg.content ? '已选用' : '使用这个',
+                    style: TextStyle(fontSize: 11, color: _selectedHtml == msg.content ? const Color(0xFF69F0AE) : const Color(0xFF4FC3F7))),
+                ]),
+              ),
+            ),
+        ]),
+        const SizedBox(height: 6),
+        if (isHtml)
+          Text('HTML 响应 (${(msg.content.length / 1024).toStringAsFixed(1)} KB)',
+            style: const TextStyle(fontSize: 11, color: Colors.white24))
+        else
+          Text(msg.content, style: const TextStyle(fontSize: 13, color: Colors.white70)),
+      ]),
+    );
+  }
+
+
+  // ── Demo ──
+  Widget _demoCard((String, String, String, String) t) {
+    final sel = _selectedDemoId == t.$1;
+    return GestureDetector(
+      onTap: () => setState(() {
+        _selectedDemoId = t.$1;
+        if (_nameController.text.isEmpty || h.demoTemplates.any((x) => x.$3 == _nameController.text)) _nameController.text = t.$3;
+        _iconConfig = IconConfig(bgColor: IconConfig.colorForString(t.$2), elements: [IconElement(content: t.$2)]);
+      }),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        decoration: BoxDecoration(
+          color: sel ? const Color(0xFF0F3460) : const Color(0xFF1A1A2E),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: sel ? const Color(0xFF4FC3F7) : Colors.transparent, width: 1.5),
+        ),
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+          Text(t.$2, style: const TextStyle(fontSize: 20)),
+          Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(t.$3, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 11, color: sel ? Colors.white : Colors.white70)),
+            Text(t.$4, style: const TextStyle(fontSize: 9, color: Colors.white38)),
+          ]),
+        ]),
+      ),
+    );
+  }
+
+  Widget _demoFields() {
+    final widgets = <Widget>[
+      const Text('选择一个演示', style: TextStyle(fontSize: 13, color: Colors.white54)),
+      const SizedBox(height: 8),
+      TextField(
+        controller: _demoFilterController,
+        onChanged: (v) => setState(() {
+          _demoFilter = v.trim().toLowerCase();
+          // Clear selection if the selected demo is no longer visible under the filter.
+          // Avoids the "Build X" action referring to a hidden card.
+          if (_selectedDemoId != null && _demoFilter.isNotEmpty) {
+            final stillVisible = h.demoTemplates.any((t) =>
+              t.$1 == _selectedDemoId && (
+                t.$1.toLowerCase().contains(_demoFilter) ||
+                t.$3.toLowerCase().contains(_demoFilter) ||
+                t.$4.toLowerCase().contains(_demoFilter)
+              ));
+            if (!stillVisible) _selectedDemoId = null;
+          }
+        }),
+        style: const TextStyle(color: Colors.white, fontSize: 14),
+        decoration: InputDecoration(
+          hintText: '筛选演示…',
+          hintStyle: const TextStyle(color: Colors.white38, fontSize: 14),
+          prefixIcon: const Icon(Icons.search, color: Colors.white38, size: 20),
+          suffixIcon: _demoFilter.isEmpty ? null : IconButton(
+            icon: const Icon(Icons.clear, color: Colors.white38, size: 18),
+            onPressed: () {
+              _demoFilterController.clear();
+              setState(() => _demoFilter = '');
+            },
+          ),
+          filled: true,
+          fillColor: Colors.white.withValues(alpha: 0.05),
+          border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+          isDense: true,
+          contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        ),
+      ),
+      const SizedBox(height: 12),
+    ];
+
+    final q = _demoFilter;
+    if (q.isEmpty) {
+      // Full grid with section headers (original layout)
+      final items = h.demoTemplates;
+      int i = 0;
+      while (i < items.length) {
+        final t = items[i];
+        if (t.$1.isEmpty) {
+          widgets.add(Padding(
+            padding: EdgeInsets.only(top: i == 0 ? 0 : 16, bottom: 8),
+            child: Text(t.$3, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600, color: Colors.white38)),
+          ));
+          i++;
+        } else if (i + 1 < items.length && items[i + 1].$1.isNotEmpty) {
+          widgets.add(Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(children: [
+              Expanded(child: SizedBox(height: 80, child: _demoCard(t))),
+              const SizedBox(width: 8),
+              Expanded(child: SizedBox(height: 80, child: _demoCard(items[i + 1]))),
+            ]),
+          ));
+          i += 2;
+        } else {
+          widgets.add(Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(children: [
+              Expanded(child: SizedBox(height: 80, child: _demoCard(t))),
+              const SizedBox(width: 8),
+              const Expanded(child: SizedBox()),
+            ]),
+          ));
+          i++;
+        }
+      }
+    } else {
+      // Filtered: flat pair grid, no section headers, match on id/name/description
+      final matches = h.demoTemplates.where((t) =>
+        t.$1.isNotEmpty && (
+          t.$1.toLowerCase().contains(q) ||
+          t.$3.toLowerCase().contains(q) ||
+          t.$4.toLowerCase().contains(q)
+        )
+      ).toList();
+      if (matches.isEmpty) {
+        widgets.add(const Padding(
+          padding: EdgeInsets.symmetric(vertical: 24),
+          child: Center(child: Text('没有匹配的演示', style: TextStyle(color: Colors.white38, fontSize: 13))),
+        ));
+      } else {
+        for (int j = 0; j < matches.length; j += 2) {
+          final left = matches[j];
+          final right = j + 1 < matches.length ? matches[j + 1] : null;
+          widgets.add(Padding(
+            padding: const EdgeInsets.only(bottom: 8),
+            child: Row(children: [
+              Expanded(child: SizedBox(height: 80, child: _demoCard(left))),
+              const SizedBox(width: 8),
+              right == null
+                ? const Expanded(child: SizedBox())
+                : Expanded(child: SizedBox(height: 80, child: _demoCard(right))),
+            ]),
+          ));
+        }
+      }
+    }
+    if (_selectedDemoId != null) {
+      widgets.add(const SizedBox(height: 12));
+      widgets.add(h.buildActionButton(
+        label: '构建${h.demoTemplates.where((t) => t.$1 == _selectedDemoId).firstOrNull?.$3 ?? '演示'}',
+        onPressed: _isBuilding ? null : _buildDemo, icon: Icons.rocket_launch));
+    }
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: widgets);
+  }
+
+  // ── Building ──
+  Widget _buildingView() => SingleChildScrollView(
+    padding: const EdgeInsets.fromLTRB(24, 32, 24, 40),
+    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Row(children: [
+        if (!_isBuilding)
+          GestureDetector(
+            onTap: () => setState(() { _showBuildLog = false; _log.clear(); }),
+            child: Container(
+              width: 38, height: 38, margin: const EdgeInsets.only(right: 12),
+              decoration: BoxDecoration(color: const Color(0xFF1A1A2E), borderRadius: BorderRadius.circular(10)),
+              child: const Icon(Icons.arrow_back, size: 18, color: Colors.white54),
+            ),
+          ),
+        Expanded(child: _appHeader(_isBuilding ? '正在构建...' : '构建完成')),
+      ]),
+      const SizedBox(height: 24),
+      if (_isBuilding && _log.isEmpty) const LinearProgressIndicator(color: Color(0xFF4FC3F7), backgroundColor: Color(0xFF1A1A2E)),
+      BuildLog(log: _log),
+      if (!_isBuilding && _log.isNotEmpty) ...[
+        const SizedBox(height: 24),
+        h.buildActionButton(label: '在我的应用中查看', onPressed: widget.onViewMyApps, icon: Icons.folder_outlined),
+        const SizedBox(height: 12),
+        h.buildActionButton(label: '继续编辑', onPressed: () => setState(() { _showBuildLog = false; _log.clear(); }), icon: Icons.edit, secondary: true),
+        const SizedBox(height: 12),
+        h.buildActionButton(label: '创建新应用', onPressed: _reset, secondary: true),
+      ],
+    ]),
+  );
+
+  // ── Shared widgets ──
+  Widget _appHeader(String sub) => Row(children: [
+    Container(width: 44, height: 44,
+      decoration: BoxDecoration(color: const Color(0xFF0F3460), borderRadius: BorderRadius.circular(12)),
+      child: ClipRRect(borderRadius: BorderRadius.circular(10), child: Image.asset('assets/ic_launcher.png', width: 44, height: 44))),
+    const SizedBox(width: 12),
+    Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      const Text('iappyxOS', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold)),
+      Text(sub, style: const TextStyle(fontSize: 12, color: Colors.white38)),
+    ]),
+  ]);
+
+  Widget _section(String title, bool expanded, VoidCallback onToggle, {required Widget child, bool done = false}) {
+    return Container(
+      decoration: BoxDecoration(color: const Color(0xFF1A1A2E), borderRadius: BorderRadius.circular(12)),
+      child: Column(children: [
+        InkWell(
+          onTap: onToggle,
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 13),
+            child: Row(children: [
+              done ? const Icon(Icons.check_circle, size: 18, color: Color(0xFF69F0AE))
+                   : Icon(expanded ? Icons.expand_less : Icons.expand_more, size: 18, color: Colors.white38),
+              const SizedBox(width: 10),
+              Expanded(child: Text(title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600))),
+            ]),
+          ),
+        ),
+        if (expanded) Padding(padding: const EdgeInsets.fromLTRB(14, 0, 14, 14), child: child),
+      ]),
+    );
+  }
+}
+
+// ── Provider Setup Page ──
+
+class ProviderSetupPage extends StatefulWidget {
+  final AiProvider provider;
+  const ProviderSetupPage({required this.provider});
+  @override
+  State<ProviderSetupPage> createState() => ProviderSetupPageState();
+}
+
+class ProviderSetupPageState extends State<ProviderSetupPage> {
+  late final TextEditingController _keyController;
+  final _searchController = TextEditingController();
+  late AiProvider _provider;
+  List<AiModel> _models = [];
+  String _searchQuery = '';
+  bool _loading = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _provider = AiProvider(
+      id: widget.provider.id, name: widget.provider.name, baseUrl: widget.provider.baseUrl,
+      apiKey: widget.provider.apiKey, selectedModel: widget.provider.selectedModel,
+      models: List.from(widget.provider.models),
+    );
+    _keyController = TextEditingController(text: _provider.apiKey);
+    _models = List.from(_provider.models);
+    // Auto-fetch OpenRouter models (public endpoint)
+    if (_provider.id == 'openrouter' && _models.isEmpty) _fetchModels();
+  }
+
+  @override
+  void dispose() {
+    _keyController.dispose();
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _fetchModels() async {
+    // OpenRouter models are public; Anthropic requires a key
+    if (_provider.id != 'openrouter' && _keyController.text.trim().isEmpty) return;
+    final apiKey = _keyController.text.trim();
+    setState(() { _loading = true; _error = null; });
+    try {
+      if (_provider.id == 'anthropic') {
+        _models = await AiService.fetchAnthropicModels(apiKey);
+      } else if (_provider.id == 'openrouter') {
+        _models = await AiService.fetchOpenRouterModels(apiKey);
+      }
+      setState(() => _loading = false);
+    } catch (e) {
+      setState(() { _loading = false; _error = '获取模型失败：$e'; });
+    }
+  }
+
+  Future<void> _autoSave() async {
+    _provider.apiKey = _keyController.text.trim();
+    await Settings.updateProvider(_provider);
+    await Settings.setActiveProvider(_provider);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) await _autoSave();
+      },
+      child: Scaffold(
+      backgroundColor: const Color(0xFF0D0D1A),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF0D0D1A),
+        title: Text(_provider.name, style: const TextStyle(fontSize: 16)),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () async { await _autoSave(); Navigator.pop(context, _provider); },
+        ),
+      ),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(20),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('API 密钥', style: TextStyle(fontSize: 13, color: Colors.white54)),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(child: TextField(
+              controller: _keyController,
+              style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'),
+              obscureText: true,
+              decoration: InputDecoration(
+                hintText: _provider.id == 'anthropic' ? 'sk-ant-...' : 'sk-or-...',
+                filled: true, fillColor: const Color(0xFF1A1A2E),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              ),
+              onEditingComplete: () { _autoSave(); _fetchModels(); },
+            )),
+            ...[
+              const SizedBox(width: 8),
+              GestureDetector(
+                onTap: _loading ? null : _fetchModels,
+                child: Container(
+                  width: 44, height: 44,
+                  decoration: BoxDecoration(color: const Color(0xFF0F3460), borderRadius: BorderRadius.circular(10)),
+                  child: _loading
+                      ? const Padding(padding: EdgeInsets.all(12), child: CircularProgressIndicator(strokeWidth: 2, color: Color(0xFF4FC3F7)))
+                      : const Icon(Icons.refresh, size: 18, color: Color(0xFF4FC3F7)),
+                ),
+              ),
+            ],
+          ]),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(_error!, style: const TextStyle(fontSize: 11, color: Color(0xFFFF6B6B))),
+          ],
+
+          const SizedBox(height: 20),
+          const Text('模型', style: TextStyle(fontSize: 13, color: Colors.white54)),
+          const SizedBox(height: 8),
+
+          if (_models.length > 10)
+            TextField(
+              controller: _searchController,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+              decoration: InputDecoration(
+                hintText: '搜索模型...',
+                prefixIcon: const Icon(Icons.search, size: 18, color: Colors.white24),
+                filled: true, fillColor: const Color(0xFF1A1A2E),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+              ),
+              onChanged: (v) => setState(() => _searchQuery = v.toLowerCase()),
+            ),
+          if (_models.length > 10) const SizedBox(height: 8),
+
+          if (_models.isEmpty)
+            GestureDetector(
+              onTap: _fetchModels,
+              child: Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(color: const Color(0xFF1A1A2E), borderRadius: BorderRadius.circular(10)),
+                child: const Text('输入 API 密钥并点击刷新以加载模型',
+                    style: TextStyle(fontSize: 12, color: Colors.white38), textAlign: TextAlign.center),
+              ),
+            )
+          else
+            ...(_models.where((m) => _searchQuery.isEmpty || m.name.toLowerCase().contains(_searchQuery) || m.id.toLowerCase().contains(_searchQuery)).map((m) {
+              final selected = _provider.selectedModel == m.id;
+              return GestureDetector(
+                onTap: () { setState(() => _provider.selectedModel = m.id); _autoSave(); },
+                child: Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.only(bottom: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  decoration: BoxDecoration(
+                    color: selected ? const Color(0xFF0F3460) : const Color(0xFF1A1A2E),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: selected ? const Color(0xFF4FC3F7) : Colors.transparent),
+                  ),
+                  child: Row(children: [
+                    Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text(m.name, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600,
+                          color: selected ? Colors.white : Colors.white70)),
+                      if (m.description != null)
+                        Text(m.description!, style: const TextStyle(fontSize: 10, color: Colors.white38)),
+                      if (m.contextLength != null || m.pricePer1mTokens != null)
+                        Text(
+                          [
+                            if (m.contextLength != null) '${(m.contextLength! / 1000).round()}K 上下文',
+                            if (m.pricePer1mTokens != null) '\$${m.pricePer1mTokens!.toStringAsFixed(2)}/1M Token',
+                          ].join(' · '),
+                          style: const TextStyle(fontSize: 9, color: Colors.white24),
+                        ),
+                    ])),
+                    if (selected)
+                      const Icon(Icons.check_circle, size: 18, color: Color(0xFF4FC3F7)),
+                  ]),
+                ),
+              );
+            })),
+
+          const SizedBox(height: 40),
+        ]),
+      ),
+    ),
+    );
+  }
+}
+
