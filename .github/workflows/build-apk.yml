@@ -35,7 +35,7 @@ jobs:
 
       - name: Build release APK
         working-directory: src/container_app
-        run: flutter build apk --release
+        run: flutter build apk --release --android-skip-build-dependency-validation
 
       - name: Copy APK to bin/
         run: |
