@@ -1452,12 +1452,16 @@ class ProviderSetupPage extends StatefulWidget {
 
 class ProviderSetupPageState extends State<ProviderSetupPage> {
   late final TextEditingController _keyController;
+  late final TextEditingController _nameController;
+  late final TextEditingController _baseUrlController;
   final _searchController = TextEditingController();
+  final _newModelController = TextEditingController();
   late AiProvider _provider;
   List<AiModel> _models = [];
   String _searchQuery = '';
   bool _loading = false;
   String? _error;
+  String _protocol = 'openai';
 
   @override
   void initState() {
@@ -1466,30 +1470,46 @@ class ProviderSetupPageState extends State<ProviderSetupPage> {
       id: widget.provider.id, name: widget.provider.name, baseUrl: widget.provider.baseUrl,
       apiKey: widget.provider.apiKey, selectedModel: widget.provider.selectedModel,
       models: List.from(widget.provider.models),
+      protocol: widget.provider.protocol,
     );
+    _protocol = _provider.protocol;
     _keyController = TextEditingController(text: _provider.apiKey);
+    _nameController = TextEditingController(text: _provider.name);
+    _baseUrlController = TextEditingController(text: _provider.baseUrl);
     _models = List.from(_provider.models);
-    // Auto-fetch OpenRouter models (public endpoint)
+    // Auto-fetch OpenRouter models (public endpoint); custom providers wait
+    // until the user enters a Base URL.
     if (_provider.id == 'openrouter' && _models.isEmpty) _fetchModels();
   }
 
   @override
   void dispose() {
     _keyController.dispose();
+    _nameController.dispose();
+    _baseUrlController.dispose();
     _searchController.dispose();
+    _newModelController.dispose();
     super.dispose();
   }
 
   Future<void> _fetchModels() async {
-    // OpenRouter models are public; Anthropic requires a key
-    if (_provider.id != 'openrouter' && _keyController.text.trim().isEmpty) return;
     final apiKey = _keyController.text.trim();
+    final baseUrl = _baseUrlController.text.trim();
+    if (_provider.isCustom && baseUrl.isEmpty) {
+      setState(() => _error = '请先填写 Base URL。');
+      return;
+    }
+    // Anthropic requires a key; others may be public.
+    if (_provider.id == 'anthropic' && apiKey.isEmpty) return;
     setState(() { _loading = true; _error = null; });
     try {
       if (_provider.id == 'anthropic') {
         _models = await AiService.fetchAnthropicModels(apiKey);
       } else if (_provider.id == 'openrouter') {
         _models = await AiService.fetchOpenRouterModels(apiKey);
+      } else {
+        // Custom providers use the generic OpenAI-compatible fetch.
+        _models = await AiService.fetchOpenAICompatibleModels(baseUrl, apiKey);
       }
       setState(() => _loading = false);
     } catch (e) {
@@ -1497,8 +1517,76 @@ class ProviderSetupPageState extends State<ProviderSetupPage> {
     }
   }
 
+  /// Let the user type a model id manually (custom APIs that don't expose /models).
+  Future<void> _addModelManually() async {
+    _newModelController.clear();
+    final id = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A2E),
+        title: const Text('手动添加模型'),
+        content: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('输入模型 ID（如 gpt-4o、deepseek-chat、qwen-max）。',
+              style: TextStyle(fontSize: 12, color: Colors.white54)),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _newModelController,
+            style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'),
+            autofocus: true,
+            decoration: InputDecoration(
+              hintText: 'model-id',
+              filled: true, fillColor: const Color(0xFF0D0D1A),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(8), borderSide: BorderSide.none),
+              contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            ),
+            onSubmitted: (v) => Navigator.pop(ctx, v.trim()),
+          ),
+        ]),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('取消')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, _newModelController.text.trim()),
+            child: const Text('添加'),
+          ),
+        ],
+      ),
+    );
+    if (id == null || id.isEmpty) return;
+    if (_models.any((m) => m.id == id)) {
+      setState(() => _error = '模型 $id 已在列表中。');
+      return;
+    }
+    setState(() {
+      _models.add(AiModel(id: id, name: id));
+      if (_provider.selectedModel.isEmpty) _provider.selectedModel = id;
+      _error = null;
+    });
+    await _autoSave();
+  }
+
+  Future<void> _removeModel(AiModel model) async {
+    setState(() {
+      _models.removeWhere((m) => m.id == model.id);
+      if (_provider.selectedModel == model.id) _provider.selectedModel = _models.isNotEmpty ? _models.first.id : '';
+    });
+    await _autoSave();
+  }
+
   Future<void> _autoSave() async {
     _provider.apiKey = _keyController.text.trim();
+    if (_provider.isCustom) {
+      final name = _nameController.text.trim();
+      final baseUrl = _baseUrlController.text.trim();
+      if (name.isNotEmpty) _provider.name = name;
+      if (baseUrl.isNotEmpty) _provider.baseUrl = baseUrl;
+      _provider.protocol = _protocol;
+      // 自定义服务商未填写 Base URL 时不保存（避免残留空配置）。
+      if (_provider.baseUrl.trim().isEmpty) return;
+    }
+    _provider.models = List.from(_models);
+    if (_provider.models.isNotEmpty && !_provider.models.any((m) => m.id == _provider.selectedModel)) {
+      _provider.selectedModel = _provider.models.first.id;
+    }
     await Settings.updateProvider(_provider);
     await Settings.setActiveProvider(_provider);
   }
@@ -1522,6 +1610,49 @@ class ProviderSetupPageState extends State<ProviderSetupPage> {
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(20),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          // ── Custom provider only: name & base URL ──
+          if (_provider.isCustom) ...[
+            const Text('服务商名称', style: TextStyle(fontSize: 13, color: Colors.white54)),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _nameController,
+              style: const TextStyle(color: Colors.white, fontSize: 13),
+              decoration: InputDecoration(
+                hintText: '例如：DeepSeek、我的本地服务',
+                filled: true, fillColor: const Color(0xFF1A1A2E),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              ),
+              onEditingComplete: () { _autoSave(); },
+            ),
+            const SizedBox(height: 16),
+            const Text('Base URL', style: TextStyle(fontSize: 13, color: Colors.white54)),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _baseUrlController,
+              style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'),
+              decoration: InputDecoration(
+                hintText: 'https://api.example.com/v1',
+                filled: true, fillColor: const Color(0xFF1A1A2E),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              ),
+              onEditingComplete: () { _autoSave(); _fetchModels(); },
+            ),
+            const SizedBox(height: 8),
+            const Text('可填 /v1 根地址或完整 /chat/completions 地址，两者皆可。',
+                style: TextStyle(fontSize: 10, color: Colors.white24)),
+            const SizedBox(height: 16),
+            const Text('协议', style: TextStyle(fontSize: 13, color: Colors.white54)),
+            const SizedBox(height: 8),
+            Row(children: [
+              _protocolChip('openai', 'OpenAI 兼容', '大多数服务商（DeepSeek、通义、本地 Ollama 等）'),
+              const SizedBox(width: 8),
+              _protocolChip('anthropic', 'Anthropic', 'Anthropic Messages API 协议'),
+            ]),
+            const SizedBox(height: 20),
+          ],
+
           const Text('API 密钥', style: TextStyle(fontSize: 13, color: Colors.white54)),
           const SizedBox(height: 8),
           Row(children: [
@@ -1530,7 +1661,7 @@ class ProviderSetupPageState extends State<ProviderSetupPage> {
               style: const TextStyle(color: Colors.white, fontSize: 13, fontFamily: 'monospace'),
               obscureText: true,
               decoration: InputDecoration(
-                hintText: _provider.id == 'anthropic' ? 'sk-ant-...' : 'sk-or-...',
+                hintText: _provider.id == 'anthropic' ? 'sk-ant-...' : 'sk-...',
                 filled: true, fillColor: const Color(0xFF1A1A2E),
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
                 contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
@@ -1617,16 +1748,63 @@ class ProviderSetupPageState extends State<ProviderSetupPage> {
                     ])),
                     if (selected)
                       const Icon(Icons.check_circle, size: 18, color: Color(0xFF4FC3F7)),
+                    if (_provider.isCustom) ...[
+                      const SizedBox(width: 8),
+                      GestureDetector(
+                        onTap: () => _removeModel(m),
+                        child: const Icon(Icons.close, size: 16, color: Colors.white24),
+                      ),
+                    ],
                   ]),
                 ),
               );
             })),
+
+          const SizedBox(height: 12),
+          GestureDetector(
+            onTap: _addModelManually,
+            child: Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1A1A2E),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: Colors.white12),
+              ),
+              child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                Icon(Icons.add, size: 16, color: Color(0xFF4FC3F7)),
+                SizedBox(width: 6),
+                Text('手动添加模型', style: TextStyle(fontSize: 12, color: Color(0xFF4FC3F7))),
+              ]),
+            ),
+          ),
 
           const SizedBox(height: 40),
         ]),
       ),
     ),
     );
+  }
+
+  Widget _protocolChip(String protocol, String label, String subtitle) {
+    final selected = _protocol == protocol;
+    return Expanded(child: GestureDetector(
+      onTap: () { setState(() => _protocol = protocol); _autoSave(); },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+        decoration: BoxDecoration(
+          color: selected ? const Color(0xFF0F3460) : const Color(0xFF1A1A2E),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: selected ? const Color(0xFF4FC3F7) : Colors.white12),
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text(label, style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600,
+              color: selected ? Colors.white : Colors.white70)),
+          const SizedBox(height: 2),
+          Text(subtitle, style: const TextStyle(fontSize: 9, color: Colors.white38)),
+        ]),
+      ),
+    ));
   }
 }
 

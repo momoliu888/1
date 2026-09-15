@@ -63,7 +63,7 @@ Every generated app is a real signed APK that appears in your Android launcher. 
 
 ## Features
 
-- **AI generation** — automatic via API (Anthropic, OpenRouter) or manual copy-paste to any AI
+- **AI generation** — automatic via API (Anthropic, OpenRouter, or any custom OpenAI-compatible / Anthropic-protocol API) or manual copy-paste to any AI
 - **37 native bridge classes (140+ methods)** — camera, location, sensors, audio, notifications, push notifications (FCM), NFC, Bluetooth LE, Bluetooth Classic (serial), SSH/SFTP, SMB network shares, HTTP server/client, TCP/UDP sockets, WiFi Direct, mDNS, biometric, SQLite, contacts, SMS, calendar, clipboard, TTS, screen, vibration, alarms, media gallery, download manager, home screen widgets, scheduled background tasks, event triggers (charger / headphones / Bluetooth / WiFi / Android Auto), app-launch intents, and more
 - **Bundled app files** — attach databases, JSON, images, or any data file to your app at build time. Accessible at runtime via `readAsset()` / `extractAsset()` — no download needed
 - **Icon editor** — emoji, text, images, custom colors, gradients, shadows, filters, rotation, multiple layers
@@ -90,7 +90,7 @@ Every generated app is a real signed APK that appears in your Android launcher. 
 - **Manual (recommended)** — copy the generated prompt, paste it into any AI chat (Claude, ChatGPT, Gemini, etc.), paste the HTML back, preview, build. The Manual flow offers two prompt variants:
   - **Full (~45 KB)** — works with any AI, no internet needed on the AI's side.
   - **Linked (~600 chars)** — tiny prompt that points the AI at [`SPEC.md`](SPEC.md) via its canonical raw URL. Works with AIs that can fetch URLs (Claude.ai, ChatGPT with browsing, Gemini). Useful when your AI's paste limit rejects the full prompt.
-- **Automatic** — add your API key in Settings (Anthropic or OpenRouter), then tap "Generate" in the Create flow
+- **Automatic** — add your API key in Settings (Anthropic, OpenRouter, or a custom API), then tap "Generate" in the Create flow. **Custom API** lets you add any OpenAI-compatible or Anthropic-protocol endpoint (DeepSeek, Qwen, local Ollama, vLLM, Azure OpenAI, etc.) with its own Base URL, API key, and model list — auto-fetched from `…/models` or added manually.
 
 ### Using the spec from any AI tool
 `SPEC.md` at the repo root is the canonical iappyxOS bridge reference, always fetchable at:

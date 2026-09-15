@@ -143,6 +143,21 @@ class Settings {
     await saveProviders(providers);
   }
 
+  /// Remove a provider (custom or built-in) from the saved list,
+  /// delete its secure key, and clear the active provider if it matches.
+  static Future<void> deleteProvider(String id) async {
+    final prefs = await getPrefs();
+    final providers = await getProviders();
+    providers.removeWhere((p) => p.id == id);
+    await saveProviders(providers);
+    try { await _secure.delete(key: 'apikey_$id'); } catch (_) {}
+    // If the deleted provider was active, reset active state.
+    final active = await getActiveProvider();
+    if (active?.id == id) {
+      await prefs.remove('active_provider');
+    }
+  }
+
   // ── Legacy API key (migrate to providers) ──
   static Future<String> getApiKey() async {
     final prefs = await getPrefs();

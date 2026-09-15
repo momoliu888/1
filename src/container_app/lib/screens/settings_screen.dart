@@ -43,6 +43,7 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen> {
   AiProvider? _activeProvider;
+  List<AiProvider> _customProviders = [];
   bool _hasCustomPrompt = false;
   bool _promptOutdated = false;
   String _packagePrefix = '';
@@ -67,6 +68,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   Future<void> _load() async {
     final activeProvider = await Settings.getActiveProvider();
+    final allProviders = await Settings.getProviders();
+    final customProviders = allProviders.where((p) => p.isCustom).toList()
+      ..sort((a, b) => a.name.compareTo(b.name));
     final hasCustom = await Settings.hasCustomPrompt();
     final promptOutdated = await PromptBuilder.isPromptOutdated();
     if (!hasCustom) await PromptBuilder.markPromptAsSeen(); // track hash on first launch / after reset
@@ -78,6 +82,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (mounted) {
       setState(() {
         _activeProvider = activeProvider;
+        _customProviders = customProviders;
         _hasCustomPrompt = hasCustom;
         _promptOutdated = promptOutdated;
         _packagePrefix = prefix;
@@ -262,6 +267,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       const SizedBox(width: 8),
                       _providerButton('openrouter', 'OpenRouter', Icons.shuffle),
                     ]),
+                    if (_customProviders.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      ..._customProviders.map((p) => _customProviderRow(p)),
+                    ],
+                    const SizedBox(height: 8),
+                    _addCustomProviderButton(),
                     const SizedBox(height: 14),
                     _actionRow('配置 API 密钥与模型', Icons.settings, () async {
                       final provider = _activeProvider ?? AiProvider.anthropic();
@@ -491,6 +502,148 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   // ── UI helpers ──
+
+  /// "添加自定义 API" 入口 — 创建新的自定义服务商并进入配置页。
+  Widget _addCustomProviderButton() {
+    return GestureDetector(
+      onTap: () async {
+        final provider = AiProvider.custom(
+          name: '自定义 API',
+          baseUrl: '',
+          protocol: 'openai',
+        );
+        final result = await Navigator.push<AiProvider>(
+          context,
+          MaterialPageRoute(builder: (_) => ProviderSetupPage(provider: provider)),
+        );
+        if (result != null && result.baseUrl.trim().isNotEmpty) {
+          await Settings.setActiveProvider(result);
+          _load();
+        } else if (result != null) {
+          // 用户没有填写 Base URL，不保留
+          await Settings.deleteProvider(provider.id);
+        }
+      },
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(vertical: 10),
+        decoration: BoxDecoration(
+          color: const Color(0xFF0D0D1A),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.white12, style: BorderStyle.solid),
+        ),
+        child: const Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+          Icon(Icons.add, size: 16, color: Color(0xFF4FC3F7)),
+          SizedBox(width: 6),
+          Text('添加自定义 API', style: TextStyle(fontSize: 12, color: Color(0xFF4FC3F7))),
+        ]),
+      ),
+    );
+  }
+
+  /// 自定义服务商行：点击切换激活，右侧提供编辑与删除。
+  Widget _customProviderRow(AiProvider provider) {
+    final selected = _activeProvider?.id == provider.id;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: selected ? const Color(0xFF0F3460) : const Color(0xFF0D0D1A),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: selected ? const Color(0xFF4FC3F7) : Colors.white12),
+      ),
+      child: Row(children: [
+        Icon(Icons.dns_outlined, size: 16, color: selected ? const Color(0xFF4FC3F7) : Colors.white38),
+        const SizedBox(width: 8),
+        Expanded(
+          child: GestureDetector(
+            onTap: () => _selectProvider(provider),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(provider.name, style: TextStyle(
+                fontSize: 13, fontWeight: FontWeight.w600,
+                color: selected ? Colors.white : Colors.white70,
+              ), maxLines: 1, overflow: TextOverflow.ellipsis),
+              Text(provider.baseUrl, style: const TextStyle(fontSize: 9, color: Colors.white24),
+                maxLines: 1, overflow: TextOverflow.ellipsis),
+            ]),
+          ),
+        ),
+        if (selected)
+          const Padding(
+            padding: EdgeInsets.only(right: 6),
+            child: Icon(Icons.check_circle, size: 16, color: Color(0xFF4FC3F7)),
+          ),
+        GestureDetector(
+          onTap: () => _editCustomProvider(provider),
+          child: const Padding(
+            padding: EdgeInsets.all(6),
+            child: Icon(Icons.edit_outlined, size: 15, color: Colors.white38),
+          ),
+        ),
+        GestureDetector(
+          onTap: () => _deleteCustomProvider(provider),
+          child: const Padding(
+            padding: EdgeInsets.all(6),
+            child: Icon(Icons.delete_outline, size: 15, color: Color(0xFFFF6B6B)),
+          ),
+        ),
+      ]),
+    );
+  }
+
+  Future<void> _selectProvider(AiProvider provider) async {
+    if (_activeProvider?.id == provider.id) return;
+    final saved = await Settings.getProvider(provider.id);
+    if (saved != null && saved.apiKey.isNotEmpty) {
+      provider.apiKey = saved.apiKey;
+      provider.selectedModel = saved.selectedModel;
+      provider.models = saved.models;
+    }
+    await Settings.setActiveProvider(provider);
+    _load();
+  }
+
+  Future<void> _editCustomProvider(AiProvider provider) async {
+    final saved = await Settings.getProvider(provider.id);
+    final target = saved ?? provider;
+    final result = await Navigator.push<AiProvider>(
+      context,
+      MaterialPageRoute(builder: (_) => ProviderSetupPage(provider: target)),
+    );
+    if (result != null) {
+      if (result.baseUrl.trim().isEmpty) {
+        await Settings.deleteProvider(provider.id);
+      } else {
+        await Settings.setActiveProvider(result);
+      }
+      _load();
+    }
+  }
+
+  Future<void> _deleteCustomProvider(AiProvider provider) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1A1A2E),
+        title: Text('删除 ${provider.name}？'),
+        content: const Text('该服务商的配置与 API 密钥将被移除。', style: TextStyle(fontSize: 12, color: Colors.white54)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除', style: TextStyle(color: Color(0xFFFF6B6B))),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await Settings.deleteProvider(provider.id);
+      _load();
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('自定义 API 已删除。'), backgroundColor: Color(0xFF1A1A2E), duration: Duration(seconds: 4)),
+      );
+    }
+  }
 
   Widget _providerButton(String id, String name, IconData icon) {
     final selected = _activeProvider?.id == id;
