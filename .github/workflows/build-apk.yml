@@ -1,10 +1,14 @@
 name: Build APK
 
-# 云端构建：push 到 main 分支或手动触发时，自动构建中文版 iappyxOS APK
+# 云端构建：push 到 main 分支或手动触发时，自动构建中文版 iappyxOS APK，
+# 并把 APK 发布到 GitHub Releases（标签）中，可直接下载。
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build-apk:
@@ -49,3 +53,24 @@ jobs:
           path: |
             bin/iappyxOS.apk
           if-no-files-found: error
+
+      - name: Publish APK to GitHub Release
+        # 每次构建都更新同一个 latest 标签，方便用户始终下载到最新版。
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
+          TITLE="iappyxOS Beta（$SHA_SHORT · build #${{ github.run_number }}）"
+          BODY="由 GitHub Actions 云端自动构建（提交 ${{ github.sha }}，构建 #${{ github.run_number }}）。
+包含「自定义 API」功能：支持添加任意 OpenAI 兼容 / Anthropic 协议服务商，自定义 Base URL、API 密钥与模型列表。"
+          # 已存在同名 release / asset 时先清理，再上传（--clobber 覆盖同名 asset）
+          if gh release view latest >/dev/null 2>&1; then
+            gh release delete-asset latest iappyxOS.apk -y >/dev/null 2>&1 || true
+          fi
+          if gh release view latest >/dev/null 2>&1; then
+            gh release update latest --title "$TITLE" --notes "$BODY" --prerelease >/dev/null
+            gh release upload latest bin/iappyxOS.apk --clobber
+          else
+            gh release create latest bin/iappyxOS.apk --title "$TITLE" --notes "$BODY" --prerelease
+          fi
+          echo "✅ APK 已发布到 Release：latest"
