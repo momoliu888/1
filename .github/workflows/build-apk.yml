@@ -61,8 +61,7 @@ jobs:
         run: |
           SHA_SHORT=$(echo "${{ github.sha }}" | cut -c1-7)
           TITLE="iappyxOS Beta（$SHA_SHORT · build #${{ github.run_number }}）"
-          BODY="由 GitHub Actions 云端自动构建（提交 ${{ github.sha }}，构建 #${{ github.run_number }}）。
-包含「自定义 API」功能：支持添加任意 OpenAI 兼容 / Anthropic 协议服务商，自定义 Base URL、API 密钥与模型列表。"
+          BODY="由 GitHub Actions 云端自动构建（提交 ${{ github.sha }}，构建 #${{ github.run_number }}）。包含自定义 API 功能：支持 OpenAI 兼容 / Anthropic 协议服务商、自定义 Base URL 与模型列表。"
           # 已存在同名 release / asset 时先清理，再上传（--clobber 覆盖同名 asset）
           if gh release view latest >/dev/null 2>&1; then
             gh release delete-asset latest iappyxOS.apk -y >/dev/null 2>&1 || true
